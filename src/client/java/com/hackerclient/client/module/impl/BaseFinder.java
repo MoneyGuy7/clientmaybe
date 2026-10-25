@@ -5,6 +5,8 @@ import com.hackerclient.client.util.ChatUtil;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.Entity;
@@ -12,6 +14,7 @@ import net.minecraft.world.entity.decoration.ArmorStand;
 import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -66,7 +69,9 @@ public class BaseFinder extends Module {
 		LIVING("living", "Beds & workstations", "\u00a79", 0x6C8CFF, 2, 4),
 		FARM("farms", "Farmland & farms", "\u00a72", 0x3CB043, 4, 8),
 		PORTAL("portals", "Nether portal", "\u00a75", 0xB04CFF, 1, 0),
-		ENTITY("frames", "Item frames / armor stands", "\u00a73", 0x40E0D0, 2, 0);
+		ENTITY("frames", "Item frames / armor stands", "\u00a73", 0x40E0D0, 2, 0),
+		CROP("autofarms", "Automated farm (kelp/cane/crops...)", "\u00a7a", 0xC8F032, 4, 6),
+		STASH("stash", "Stash link (chest-hopper-chest)", "\u00a7d", 0xFF2D95, 1, 0);
 
 		final String key;
 		final String label;
@@ -128,6 +133,7 @@ public class BaseFinder extends Module {
 	private static final int RESCAN_NEAR_TICKS = 100;       // 5 s
 	private static final int RESCAN_FAR_TICKS = 400;        // 20 s
 	private static final int AMETHYST_PROXIMITY = 4;
+	private static final int FARM_PROXIMITY = 6;   // how close a hopper/observer/piston must be to a plant
 	private static final int LIST_CAP = 512;
 	private static final int LIKELY_BASE_CATS = 3;
 
@@ -281,6 +287,8 @@ public class BaseFinder extends Module {
 		EnumMap<Cat, List<int[]>> found = new EnumMap<>(Cat.class);
 		List<int[]> softLights = new ArrayList<>();
 		List<int[]> prox = new ArrayList<>();
+		List<int[]> hoppers = new ArrayList<>();
+		List<int[]> infra = new ArrayList<>(); // hoppers, observers, pistons, dispensers... (not farmland: villages have it)
 		boolean city = false;
 		boolean trial = false;
 		boolean struct = false;
@@ -305,7 +313,9 @@ public class BaseFinder extends Module {
 						if (info.litOnly && !isLit(st)) continue;
 
 						int[] pos = { baseX + x, baseY + y, baseZ + z };
+						if (info.marker == 4 && hoppers.size() < LIST_CAP * 2) hoppers.add(pos);
 						if (info.prox && prox.size() < LIST_CAP * 2) prox.add(pos);
+						if (info.cat == Cat.MACHINE && infra.size() < LIST_CAP * 2) infra.add(pos);
 						if (info.cat == null) continue;
 
 						if (info.soft) {
@@ -345,6 +355,31 @@ public class BaseFinder extends Module {
 			List<int[]> hits = new ArrayList<>();
 			for (int[] a : candidates) if (nearAny(a, prox)) hits.add(a);
 			if (!hits.isEmpty()) found.put(Cat.AMETHYST, hits);
+		}
+
+		// Stash links: a hopper touching two or more chests/barrels (chest -> hopper -> chest, stacked or side by side).
+		if (!hoppers.isEmpty()) {
+			List<int[]> links = new ArrayList<>();
+			BlockPos.MutableBlockPos mp = new BlockPos.MutableBlockPos();
+			for (int[] h : hoppers) {
+				int n = 0;
+				for (Direction d : Direction.values()) {
+					mp.set(h[0] + d.getStepX(), h[1] + d.getStepY(), h[2] + d.getStepZ());
+					if (isContainer(mc.level.getBlockState(mp))) n++;
+				}
+				if (n >= 2) links.add(h);
+			}
+			if (!links.isEmpty()) found.put(Cat.STASH, links);
+		}
+
+		// Kelp, sugar cane, bamboo, cactus, crops, saplings... only count when farm machinery is right next to them,
+		// which is what separates an automated farm (observers, pistons, hoppers, dispensers for bone meal)
+		// from natural oceans, deserts, jungles and villages.
+		List<int[]> plants = found.remove(Cat.CROP);
+		if (plants != null) {
+			List<int[]> hits = new ArrayList<>();
+			for (int[] a : plants) if (nearAny(a, infra, FARM_PROXIMITY)) hits.add(a);
+			if (!hits.isEmpty()) found.put(Cat.CROP, hits);
 		}
 
 		if (found.isEmpty()) {
@@ -415,10 +450,14 @@ public class BaseFinder extends Module {
 	}
 
 	private static boolean nearAny(int[] a, List<int[]> others) {
+		return nearAny(a, others, AMETHYST_PROXIMITY);
+	}
+
+	private static boolean nearAny(int[] a, List<int[]> others, int r) {
 		for (int[] o : others) {
-			if (Math.abs(a[0] - o[0]) <= AMETHYST_PROXIMITY
-					&& Math.abs(a[1] - o[1]) <= AMETHYST_PROXIMITY
-					&& Math.abs(a[2] - o[2]) <= AMETHYST_PROXIMITY) {
+			if (Math.abs(a[0] - o[0]) <= r
+					&& Math.abs(a[1] - o[1]) <= r
+					&& Math.abs(a[2] - o[2]) <= r) {
 				return true;
 			}
 		}
@@ -437,6 +476,10 @@ public class BaseFinder extends Module {
 	private static boolean isFlagged(ChunkResult r) {
 		for (Cat c : Cat.values()) if (catFlagged(r, c)) return true;
 		return false;
+	}
+
+	private static boolean isContainer(BlockState st) {
+		return st.is(Blocks.CHEST) || st.is(Blocks.TRAPPED_CHEST) || st.is(Blocks.BARREL);
 	}
 
 	private static boolean isLit(BlockState st) {
@@ -499,6 +542,17 @@ public class BaseFinder extends Module {
 		}
 		if (p.equals("candle") || p.endsWith("_candle")) return new Info(Cat.LIGHT, true, true, true, 0);
 
+		// plants that farms are made of (only flagged next to farm machinery, see scanChunk)
+		switch (p) {
+			case "kelp", "kelp_plant", "sugar_cane", "bamboo", "cactus", "melon", "pumpkin", "wheat", "carrots",
+					"potatoes", "beetroots", "nether_wart", "sweet_berry_bush", "cocoa", "chorus_plant", "chorus_flower",
+					"twisting_vines", "twisting_vines_plant", "weeping_vines", "weeping_vines_plant", "mangrove_propagule" -> {
+				return new Info(Cat.CROP, false, false, false, 0);
+			}
+			default -> {}
+		}
+		if (p.endsWith("_sapling")) return new Info(Cat.CROP, false, false, false, 0);
+
 		// nether portal (active portal blocks are basically always player-made)
 		if (p.equals("nether_portal")) return new Info(Cat.PORTAL, false, true, false, 0);
 
@@ -531,7 +585,8 @@ public class BaseFinder extends Module {
 
 		// redstone machines
 		switch (p) {
-			case "hopper", "dropper", "dispenser", "observer", "piston", "sticky_piston", "comparator", "repeater",
+			case "hopper" -> { return new Info(Cat.MACHINE, false, true, false, 4); }
+			case "dropper", "dispenser", "observer", "piston", "sticky_piston", "comparator", "repeater",
 					"daylight_detector", "powered_rail", "activator_rail", "detector_rail" -> {
 				return new Info(Cat.MACHINE, false, true, false, 0);
 			}
@@ -800,7 +855,7 @@ public class BaseFinder extends Module {
 				ChatUtil.info("\u00a7f.bf set <type> <n> \u00a77- how many per chunk to flag it");
 				ChatUtil.info("\u00a7f.bf <type> on|off \u00a77- toggle a detector");
 				ChatUtil.info("\u00a7f.bf esp on|off \u00a77- on-screen highlights");
-				ChatUtil.info("\u00a77types: lights, amethyst, storage, valuables, machines, builds, living, farms, portals, frames");
+				ChatUtil.info("\u00a77types: lights, amethyst, storage, valuables, machines, builds, living, farms, portals, frames, autofarms, stash");
 			}
 			case "list" -> list(mc);
 			case "nearest" -> nearest(mc);
@@ -907,6 +962,7 @@ public class BaseFinder extends Module {
 		base.pos.put(Cat.MACHINE, testPoints(px, py, pz, fx, fz, rx, rz, 29, -3, 6));
 		base.pos.put(Cat.LIVING, testPoints(px, py, pz, fx, fz, rx, rz, 26, -5, 2));
 		base.pos.put(Cat.ENTITY, testPoints(px, py, pz, fx, fz, rx, rz, 28, 5, 2));
+		base.pos.put(Cat.STASH, testPoints(px, py, pz, fx, fz, rx, rz, 27, -8, 1));
 		testResults.add(base);
 
 		// 2) a lone portal far ahead and to the right (checks the "far = stronger highlight")
@@ -922,13 +978,14 @@ public class BaseFinder extends Module {
 		// 4) a farm to the left, deep underground
 		ChunkResult farm = new ChunkResult();
 		farm.pos.put(Cat.FARM, testPoints(px, Math.max(py - 40, -60), pz, fx, fz, rx, rz, 15, -35, 4));
+		farm.pos.put(Cat.CROP, testPoints(px, Math.max(py - 40, -60), pz, fx, fz, rx, rz, 18, -35, 6));
 		testResults.add(farm);
 
 		testUntil = tick + 600;
 		baseFlashUntil = tick + 100;
 		ChatUtil.info("\u00a7eTEST\u00a7r placed " + testResults.size() + " fake spots. Look ahead: the cluster should say BASE.");
 		ChatUtil.info("\u00a77Portal far ahead-right, valuables behind you (edge arrow), farm left and below. Gone in 30 s.");
-		ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(5 signs) at " + fmt(mc, base.pos.get(Cat.LIGHT).get(0)) + " \u00a78[test]");
+		ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(6 signs) at " + fmt(mc, base.pos.get(Cat.LIGHT).get(0)) + " \u00a78[test]");
 	}
 
 	private static List<int[]> testPoints(int px, int py, int pz, double fx, double fz, double rx, double rz,
