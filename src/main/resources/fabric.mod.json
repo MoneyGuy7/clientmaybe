@@ -1,0 +1,27 @@
+{
+	"schemaVersion": 1,
+	"id": "hackerclient",
+	"version": "${version}",
+	"name": "Hacker Client",
+	"description": "Base client for the Hacker SMP. Modules: BaseFinder.",
+	"authors": [
+		"Hacker SMP"
+	],
+	"license": "CC0-1.0",
+	"icon": "assets/hackerclient/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"com.hackerclient.HackerClientMod"
+		],
+		"client": [
+			"com.hackerclient.client.HackerClientInit"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
