@@ -2,16 +2,28 @@ package com.hackerclient.client.module.impl;
 
 import com.hackerclient.client.module.Module;
 import com.hackerclient.client.util.ChatUtil;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.decoration.ArmorStand;
+import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.phys.AABB;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -30,7 +42,13 @@ import java.util.Map;
  *  - storage    chests, trapped chests, barrels
  *  - valuables  ender chests, shulker boxes, beacons, enchanting tables, anvils, netherite/diamond/emerald blocks...
  *  - machines   hoppers, droppers, dispensers, observers, pistons, comparators, repeaters
- *  - builds     concrete, glazed terracotta, glass, signs, tnt, jukeboxes, note blocks
+ *  - builds     concrete, glazed terracotta, glass, signs, tnt, jukeboxes, note blocks, bricks, quartz...
+ *  - living     beds, crafting tables, furnaces, brewing stands, smithing tables, lecterns...
+ *  - farms      farmland, composters, beehives
+ *  - portals    lit nether portals
+ *  - frames     item frames and armor stands (entities)
+ *
+ * A chunk with 3+ different flagged categories is called out as a LIKELY BASE.
  *
  * Results are dropped as soon as their chunk is no longer loaded or is out of range, so after you
  * teleport away nothing from the old area stays on your screen.
@@ -38,26 +56,33 @@ import java.util.Map;
 public class BaseFinder extends Module {
 
 	private enum Cat {
-		LIGHT("lights", "Man-placed light", "\u00a7e", 0xFFE04A, 3),
-		AMETHYST("amethyst", "Grown amethyst", "\u00a7d", 0xD05CFF, 1),
-		STORAGE("storage", "Storage", "\u00a76", 0xFF9A3C, 3),
-		VALUABLE("valuables", "Valuable blocks", "\u00a7b", 0x4AE0FF, 1),
-		MACHINE("machines", "Redstone machines", "\u00a7c", 0xFF5050, 6),
-		BUILD("builds", "Player building", "\u00a7a", 0x7CFF7C, 12);
+		//   key        label                     colour    rgb       min  bonus-near-natural-structure
+		LIGHT("lights", "Man-placed light", "\u00a7e", 0xFFE04A, 3, 6),
+		AMETHYST("amethyst", "Grown amethyst", "\u00a7d", 0xD05CFF, 1, 0),
+		STORAGE("storage", "Storage", "\u00a76", 0xFF9A3C, 3, 4),
+		VALUABLE("valuables", "Valuable blocks", "\u00a7b", 0x4AE0FF, 1, 0),
+		MACHINE("machines", "Redstone machines", "\u00a7c", 0xFF5050, 6, 3),
+		BUILD("builds", "Player building", "\u00a7a", 0x7CFF7C, 12, 0),
+		LIVING("living", "Beds & workstations", "\u00a79", 0x6C8CFF, 2, 4),
+		FARM("farms", "Farmland & farms", "\u00a72", 0x3CB043, 4, 8),
+		PORTAL("portals", "Nether portal", "\u00a75", 0xB04CFF, 1, 0),
+		ENTITY("frames", "Item frames / armor stands", "\u00a73", 0x40E0D0, 2, 0);
 
 		final String key;
 		final String label;
 		final String code;
 		final int rgb;
+		final int bonus;  // extra needed when the chunk also holds a natural structure (village, stronghold...)
 		int min;          // how many are needed in one chunk before it is flagged
 		boolean on = true;
 
-		Cat(String key, String label, String code, int rgb, int min) {
+		Cat(String key, String label, String code, int rgb, int min, int bonus) {
 			this.key = key;
 			this.label = label;
 			this.code = code;
 			this.rgb = rgb;
 			this.min = min;
+			this.bonus = bonus;
 		}
 
 		static Cat byKey(String k) {
@@ -95,11 +120,16 @@ public class BaseFinder extends Module {
 	private boolean esp = true;
 
 	// ---- tuning ----
-	private static final int CHUNKS_PER_TICK = 2;
-	private static final int RESCAN_TICKS = 600;
+	private static final int SCAN_BUDGET_NANOS = 3_000_000; // max time spent scanning per tick (about 3 ms)
+	private static final int REFILL_TICKS = 5;              // rebuild the scan queue every 0.25 s
+	private static final int PRUNE_TICKS = 10;
+	private static final int ENTITY_TICKS = 10;
+	private static final int NEAR_CHUNKS = 4;               // chunks this close are rescanned more often
+	private static final int RESCAN_NEAR_TICKS = 100;       // 5 s
+	private static final int RESCAN_FAR_TICKS = 400;        // 20 s
 	private static final int AMETHYST_PROXIMITY = 4;
 	private static final int LIST_CAP = 512;
-	private static final int STRUCTURE_LIGHT_BONUS = 6;
+	private static final int LIKELY_BASE_CATS = 3;
 
 	// ---- state ----
 	private final Map<Long, ChunkResult> results = new HashMap<>();
@@ -107,11 +137,16 @@ public class BaseFinder extends Module {
 	private final Map<Long, Integer> alertMask = new HashMap<>();
 	private final ArrayDeque<int[]> queue = new ArrayDeque<>();
 	private final Map<Block, Info> infoCache = new IdentityHashMap<>();
+	private Map<Long, List<int[]>> entityPos = new HashMap<>();
 	private Level lastLevel;
 	private int tick;
+	private boolean chunkArrived;
+	private boolean log = true;
 
 	public BaseFinder() {
-		super("BaseFinder", "Finds player bases (light, amethyst, storage, machines, builds) and highlights them", "bf");
+		super("BaseFinder", "Finds player bases (light, amethyst, storage, machines, builds, farms, portals...) and highlights them", "bf");
+		// New chunk from the server: rebuild the queue next tick so it is scanned right away instead of waiting.
+		ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> chunkArrived = true);
 	}
 
 	@Override
@@ -141,12 +176,24 @@ public class BaseFinder extends Module {
 		if (mc.level == null || mc.player == null) return;
 		tick++;
 
-		if (tick % 20 == 0) prune(mc);
-		if (queue.isEmpty() && tick % 20 == 0) refillQueue(mc);
+		if (tick % PRUNE_TICKS == 0) prune(mc);
+		if (tick % ENTITY_TICKS == 0) scanEntities(mc);
 
-		for (int i = 0; i < CHUNKS_PER_TICK && !queue.isEmpty(); i++) {
+		// The queue is rebuilt (nearest + never-scanned first) every few ticks, or immediately when a chunk
+		// arrives, so it can never go stale after you move and never has to drain before new chunks are seen.
+		if (chunkArrived || tick % REFILL_TICKS == 0) {
+			chunkArrived = false;
+			refillQueue(mc);
+		}
+
+		// Scan by time budget instead of a fixed chunk count: fast when there is a lot to do, cheap when idle.
+		long start = System.nanoTime();
+		int done = 0;
+		while (!queue.isEmpty()) {
+			if (done >= 1 && System.nanoTime() - start > SCAN_BUDGET_NANOS) break;
 			int[] c = queue.poll();
 			scanChunk(mc, c[0], c[1]);
+			done++;
 		}
 	}
 
@@ -162,6 +209,8 @@ public class BaseFinder extends Module {
 		alertMask.clear();
 		queue.clear();
 		infoCache.clear();
+		entityPos = new HashMap<>();
+		chunkArrived = false;
 		lastLevel = null;
 	}
 
@@ -192,12 +241,18 @@ public class BaseFinder extends Module {
 				int dist2 = dx * dx + dz * dz;
 				if (dist2 > radiusChunks * radiusChunks) continue;
 				int cx = pcx + dx, cz = pcz + dz;
+				if (mc.level.getChunkSource().getChunkNow(cx, cz) == null) continue;
 				Integer last = lastScan.get(chunkKey(cx, cz));
-				if (last != null && tick - last < RESCAN_TICKS) continue;
-				todo.add(new int[] { dist2, cx, cz });
+				if (last != null) {
+					int every = dist2 <= NEAR_CHUNKS * NEAR_CHUNKS ? RESCAN_NEAR_TICKS : RESCAN_FAR_TICKS;
+					if (tick - last < every) continue;
+				}
+				// chunks we have never looked at go first, then nearest first
+				todo.add(new int[] { (last == null ? -100000 : 0) + dist2, cx, cz });
 			}
 		}
 		todo.sort((a, b) -> Integer.compare(a[0], b[0]));
+		queue.clear();
 		for (int[] t : todo) queue.add(new int[] { t[1], t[2] });
 	}
 
@@ -259,6 +314,9 @@ public class BaseFinder extends Module {
 			for (int[] p : softLights) if (l.size() < LIST_CAP) l.add(p);
 		}
 
+		List<int[]> ents = entityPos.get(key);
+		if (ents != null && !ents.isEmpty()) found.put(Cat.ENTITY, ents);
+
 		// Amethyst only counts when a player-made block is right next to it.
 		List<int[]> candidates = found.remove(Cat.AMETHYST);
 		if (candidates != null) {
@@ -277,7 +335,11 @@ public class BaseFinder extends Module {
 		r.pos.putAll(found);
 		r.struct = struct || city;
 		results.put(key, r);
+		reflag(mc, key, r);
+	}
 
+	/** Re-evaluate which categories a chunk trips and announce anything newly flagged. */
+	private void reflag(Minecraft mc, long key, ChunkResult r) {
 		int oldMask = alertMask.getOrDefault(key, 0);
 		int newMask = 0;
 		for (Cat c : Cat.values()) {
@@ -286,7 +348,47 @@ public class BaseFinder extends Module {
 				if ((oldMask & (1 << c.ordinal())) == 0) announce(mc, r, c);
 			}
 		}
+		if (Integer.bitCount(newMask) >= LIKELY_BASE_CATS && Integer.bitCount(oldMask) < LIKELY_BASE_CATS) {
+			int[] a = anchor(r);
+			String where = a == null ? "?" : fmt(mc, a);
+			ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(" + Integer.bitCount(newMask) + " signs) at " + where);
+			logLine("LIKELY BASE (" + Integer.bitCount(newMask) + " signs)", a);
+		}
 		if (newMask == 0) alertMask.remove(key); else alertMask.put(key, newMask);
+	}
+
+	private static boolean likelyBase(ChunkResult r) {
+		int n = 0;
+		for (Cat c : Cat.values()) if (catFlagged(r, c)) n++;
+		return n >= LIKELY_BASE_CATS;
+	}
+
+	// ------------------------------------------------------------------ entities (item frames, armor stands)
+
+	private void scanEntities(Minecraft mc) {
+		Map<Long, List<int[]>> m = new HashMap<>();
+		if (mc.level.dimension() != Level.END) {
+			double r = radiusChunks * 16.0;
+			AABB box = mc.player.getBoundingBox().inflate(r, 400, r);
+			for (Entity e : mc.level.getEntities((Entity) null, box)) {
+				if (!(e instanceof ItemFrame) && !(e instanceof ArmorStand)) continue;
+				int x = e.blockPosition().getX(), y = e.blockPosition().getY(), z = e.blockPosition().getZ();
+				List<int[]> l = m.computeIfAbsent(chunkKey(x >> 4, z >> 4), k -> new ArrayList<>());
+				if (l.size() < LIST_CAP) l.add(new int[] { x, y, z });
+			}
+		}
+		entityPos = m;
+
+		// fold into the per-chunk results
+		for (ChunkResult r : results.values()) r.pos.remove(Cat.ENTITY);
+		for (Map.Entry<Long, List<int[]>> en : m.entrySet()) {
+			results.computeIfAbsent(en.getKey(), k -> new ChunkResult()).pos.put(Cat.ENTITY, en.getValue());
+		}
+		results.entrySet().removeIf(en -> en.getValue().pos.isEmpty());
+		alertMask.keySet().removeIf(k -> !results.containsKey(k));
+		for (Map.Entry<Long, ChunkResult> en : new ArrayList<>(results.entrySet())) {
+			reflag(mc, en.getKey(), en.getValue());
+		}
 	}
 
 	private static boolean nearAny(int[] a, List<int[]> others) {
@@ -301,7 +403,7 @@ public class BaseFinder extends Module {
 	}
 
 	private static int threshold(ChunkResult r, Cat c) {
-		return c.min + ((c == Cat.LIGHT && r.struct) ? STRUCTURE_LIGHT_BONUS : 0);
+		return c.min + (r.struct ? c.bonus : 0);
 	}
 
 	private static boolean catFlagged(ChunkResult r, Cat c) {
@@ -338,7 +440,7 @@ public class BaseFinder extends Module {
 		switch (p) {
 			case "sculk", "sculk_shrieker", "sculk_catalyst", "sculk_sensor", "calibrated_sculk_sensor",
 					"reinforced_deepslate" -> { return new Info(null, false, false, false, 1); }
-			case "trial_spawner", "vault", "spawner", "end_portal_frame" -> { return new Info(null, false, false, false, 2); }
+			case "trial_spawner", "vault", "spawner", "end_portal_frame", "bell" -> { return new Info(null, false, false, false, 2); }
 			default -> {}
 		}
 
@@ -362,11 +464,25 @@ public class BaseFinder extends Module {
 		}
 		if (p.equals("candle") || p.endsWith("_candle")) return new Info(Cat.LIGHT, true, true, true, 0);
 
+		// nether portal (active portal blocks are basically always player-made)
+		if (p.equals("nether_portal")) return new Info(Cat.PORTAL, false, true, false, 0);
+
+		// beds and workstations (villages have these too, so a village raises the threshold)
+		if (p.endsWith("_bed")) return new Info(Cat.LIVING, false, true, false, 0);
+		switch (p) {
+			case "crafting_table", "furnace", "blast_furnace", "smoker", "brewing_stand", "smithing_table",
+					"grindstone", "stonecutter", "loom", "cartography_table", "fletching_table", "lectern" -> {
+				return new Info(Cat.LIVING, false, true, false, 0);
+			}
+			case "farmland", "composter", "beehive" -> { return new Info(Cat.FARM, false, false, false, 0); }
+			default -> {}
+		}
+
 		// valuables
 		if (p.endsWith("shulker_box")) return end ? NONE : new Info(Cat.VALUABLE, false, true, false, 0);
 		switch (p) {
 			case "ender_chest", "beacon", "enchanting_table", "respawn_anchor", "conduit", "netherite_block",
-					"diamond_block", "emerald_block", "lodestone", "anvil", "chipped_anvil", "damaged_anvil" -> {
+					"diamond_block", "emerald_block", "gold_block", "iron_block", "lapis_block", "lodestone", "anvil", "chipped_anvil", "damaged_anvil" -> {
 				return new Info(Cat.VALUABLE, false, true, false, 0);
 			}
 			default -> {}
@@ -380,7 +496,8 @@ public class BaseFinder extends Module {
 
 		// redstone machines
 		switch (p) {
-			case "hopper", "dropper", "dispenser", "observer", "piston", "sticky_piston", "comparator", "repeater" -> {
+			case "hopper", "dropper", "dispenser", "observer", "piston", "sticky_piston", "comparator", "repeater",
+					"daylight_detector", "powered_rail", "activator_rail", "detector_rail" -> {
 				return new Info(Cat.MACHINE, false, true, false, 0);
 			}
 			default -> {}
@@ -390,7 +507,9 @@ public class BaseFinder extends Module {
 		if (p.endsWith("_concrete") || p.endsWith("_concrete_powder") || p.endsWith("glazed_terracotta")
 				|| p.endsWith("_stained_glass") || p.endsWith("_stained_glass_pane")
 				|| p.equals("glass") || p.equals("tinted_glass") || p.endsWith("_sign")
-				|| p.equals("tnt") || p.equals("jukebox") || p.equals("note_block")) {
+				|| p.equals("tnt") || p.equals("jukebox") || p.equals("note_block")
+				|| p.equals("bricks") || p.equals("smooth_stone") || p.equals("quartz_block") || p.equals("quartz_bricks")
+				|| p.equals("quartz_pillar") || p.equals("chiseled_quartz_block") || p.equals("smooth_quartz")) {
 			return new Info(Cat.BUILD, false, false, false, 0);
 		}
 
@@ -410,6 +529,25 @@ public class BaseFinder extends Module {
 	private void announce(Minecraft mc, ChunkResult r, Cat c) {
 		List<int[]> l = r.pos.get(c);
 		ChatUtil.info(c.code + c.label + " \u00a7fx" + l.size() + " \u00a77at " + fmt(mc, l.get(0)));
+		logLine(c.label + " x" + l.size(), l.get(0));
+	}
+
+	/** Appends a finding to .minecraft/config/hackerclient/basefinder-<server>.txt */
+	private void logLine(String what, int[] p) {
+		if (!log || p == null) return;
+		try {
+			Minecraft mc = Minecraft.getInstance();
+			String server = mc.getCurrentServer() != null ? mc.getCurrentServer().ip : "singleplayer";
+			server = server.replaceAll("[^A-Za-z0-9._-]", "_");
+			Path dir = FabricLoader.getInstance().getConfigDir().resolve("hackerclient");
+			Files.createDirectories(dir);
+			String dim = mc.level.dimension() == Level.NETHER ? "nether" : mc.level.dimension() == Level.END ? "end" : "overworld";
+			String line = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+					+ "  [" + dim + "]  " + what + "  at " + p[0] + ", " + p[1] + ", " + p[2] + "\n";
+			Files.writeString(dir.resolve("basefinder-" + server + ".txt"), line,
+					StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+		} catch (IOException | RuntimeException ignored) {
+		}
 	}
 
 	private static String fmt(Minecraft mc, int[] p) {
@@ -466,7 +604,7 @@ public class BaseFinder extends Module {
 				if (!catFlagged(r, c)) continue;
 				for (int[] p : r.pos.get(c)) {
 					double dx = p[0] + 0.5 - cam.ex, dy = p[1] + 0.5 - cam.ey, dz = p[2] + 0.5 - cam.ez;
-					targets.add(new double[] { Math.sqrt(dx * dx + dy * dy + dz * dz), p[0], p[1], p[2], c.ordinal() });
+					targets.add(new double[] { Math.sqrt(dx * dx + dy * dy + dz * dz), p[0], p[1], p[2], c.ordinal(), likelyBase(r) ? 1 : 0 });
 				}
 			}
 		}
@@ -504,7 +642,7 @@ public class BaseFinder extends Module {
 			allFront = true;
 		}
 
-		String text = (int) dist + "m  y" + (int) by;
+		String text = (int) dist + "m  y" + (int) by + (t[5] == 1 ? "  BASE" : "");
 
 		if (allFront && maxX >= 0 && minX <= c.w && maxY >= 0 && minY <= c.h) {
 			int x1 = (int) Math.floor(minX), x2 = (int) Math.ceil(maxX);
@@ -555,14 +693,21 @@ public class BaseFinder extends Module {
 		switch (sub) {
 			case "help" -> {
 				ChatUtil.info("\u00a7f.bf list \u00a77- flagged spots, nearest first");
+				ChatUtil.info("\u00a7f.bf nearest \u00a77- direction + distance to the closest flagged spot");
+				ChatUtil.info("\u00a7f.bf log on|off \u00a77- save finds to config/hackerclient/");
 				ChatUtil.info("\u00a7f.bf status \u00a77/ \u00a7f.bf clear");
 				ChatUtil.info("\u00a7f.bf set radius <2-32> \u00a77- scan radius in chunks");
 				ChatUtil.info("\u00a7f.bf set <type> <n> \u00a77- how many per chunk to flag it");
 				ChatUtil.info("\u00a7f.bf <type> on|off \u00a77- toggle a detector");
 				ChatUtil.info("\u00a7f.bf esp on|off \u00a77- on-screen highlights");
-				ChatUtil.info("\u00a77types: lights, amethyst, storage, valuables, machines, builds");
+				ChatUtil.info("\u00a77types: lights, amethyst, storage, valuables, machines, builds, living, farms, portals, frames");
 			}
 			case "list" -> list(mc);
+			case "nearest" -> nearest(mc);
+			case "log" -> {
+				if (args.length > 1) log = args[1].equalsIgnoreCase("on");
+				ChatUtil.info("log " + (log ? "\u00a7aon" : "\u00a7coff"));
+			}
 			case "clear" -> { reset(); lastLevel = mc.level; ChatUtil.info("Cleared."); }
 			case "status" -> status(mc);
 			case "esp" -> {
@@ -637,6 +782,26 @@ public class BaseFinder extends Module {
 			}
 			ChatUtil.info(sb + "\u00a77at " + fmt(mc, anchor(r)));
 		}
+	}
+
+	private void nearest(Minecraft mc) {
+		if (mc.player == null) return;
+		int[] best = null;
+		double bestD = Double.MAX_VALUE;
+		boolean bestLikely = false;
+		for (ChunkResult r : results.values()) {
+			if (!isFlagged(r)) continue;
+			int[] a = anchor(r);
+			double d = dist2(a, mc.player.getX(), mc.player.getZ());
+			if (d < bestD) { bestD = d; best = a; bestLikely = likelyBase(r); }
+		}
+		if (best == null) { ChatUtil.info("Nothing flagged yet."); return; }
+		double dx = best[0] + 0.5 - mc.player.getX(), dz = best[2] + 0.5 - mc.player.getZ();
+		// +x is east, +z is south
+		String[] names = { "east", "south-east", "south", "south-west", "west", "north-west", "north", "north-east" };
+		double ang = Math.toDegrees(Math.atan2(dz, dx));
+		int idx = (int) Math.round(((ang % 360) + 360) % 360 / 45.0) % 8;
+		ChatUtil.info("Nearest" + (bestLikely ? " \u00a74LIKELY BASE" : "") + " \u00a77\u2192 \u00a7f" + names[idx] + " \u00a77at " + fmt(mc, best));
 	}
 
 	private static double dist2(int[] p, double px, double pz) {
