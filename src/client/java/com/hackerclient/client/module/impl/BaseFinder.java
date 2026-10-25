@@ -141,6 +141,9 @@ public class BaseFinder extends Module {
 	private Level lastLevel;
 	private int tick;
 	private boolean chunkArrived;
+	private final java.util.Set<Long> trialChunks = new java.util.HashSet<>();
+	private final List<ChunkResult> testResults = new ArrayList<>();
+	private int testUntil;
 	private boolean log = true;
 
 	public BaseFinder() {
@@ -210,6 +213,8 @@ public class BaseFinder extends Module {
 		queue.clear();
 		infoCache.clear();
 		entityPos = new HashMap<>();
+		trialChunks.clear();
+		testResults.clear();
 		chunkArrived = false;
 		lastLevel = null;
 	}
@@ -222,6 +227,8 @@ public class BaseFinder extends Module {
 		results.keySet().removeIf(k -> stale(mc, k, pcx, pcz, lim));
 		lastScan.keySet().removeIf(k -> stale(mc, k, pcx, pcz, lim));
 		alertMask.keySet().removeIf(k -> !results.containsKey(k));
+		trialChunks.removeIf(k -> stale(mc, k, pcx, pcz, lim));
+		if (!testResults.isEmpty() && tick > testUntil) { testResults.clear(); ChatUtil.info("Test markers expired."); }
 	}
 
 	private static boolean stale(Minecraft mc, long key, int pcx, int pcz, int lim) {
@@ -273,6 +280,7 @@ public class BaseFinder extends Module {
 		List<int[]> softLights = new ArrayList<>();
 		List<int[]> prox = new ArrayList<>();
 		boolean city = false;
+		boolean trial = false;
 		boolean struct = false;
 
 		for (int i = 0; i < sections.length; i++) {
@@ -289,6 +297,7 @@ public class BaseFinder extends Module {
 						if (info == NONE) continue;
 
 						if (info.marker == 1) city = true;
+						else if (info.marker == 3) trial = true;
 						else if (info.marker == 2) struct = true;
 
 						if (info.litOnly && !isLit(st)) continue;
@@ -308,8 +317,19 @@ public class BaseFinder extends Module {
 			}
 		}
 
-		// Soul lanterns / soul torches / candles fill ancient cities, so only count them outside one.
-		if (!city && !softLights.isEmpty()) {
+		// Trial chambers (copper bulbs, copper lanterns/torches...) are natural too, and a chamber spans several
+		// chunks, so also treat chunks next to a known trial-chamber chunk as part of it.
+		if (trial) trialChunks.add(key);
+		boolean nearTrial = trial;
+		for (int ox = -1; ox <= 1 && !nearTrial; ox++) {
+			for (int oz = -1; oz <= 1; oz++) {
+				if (trialChunks.contains(chunkKey(cx + ox, cz + oz))) { nearTrial = true; break; }
+			}
+		}
+
+		// Soul lanterns / soul torches / candles / copper lights fill ancient cities and trial chambers,
+		// so only count them outside one.
+		if (!city && !nearTrial && !softLights.isEmpty()) {
 			List<int[]> l = found.computeIfAbsent(Cat.LIGHT, k -> new ArrayList<>());
 			for (int[] p : softLights) if (l.size() < LIST_CAP) l.add(p);
 		}
@@ -333,7 +353,7 @@ public class BaseFinder extends Module {
 
 		ChunkResult r = new ChunkResult();
 		r.pos.putAll(found);
-		r.struct = struct || city;
+		r.struct = struct || city || trial;
 		results.put(key, r);
 		reflag(mc, key, r);
 	}
@@ -436,17 +456,24 @@ public class BaseFinder extends Module {
 			default -> {}
 		}
 
+		// trial chamber markers: copper grates, chiseled copper, copper doors/trapdoors (incl. waxed/weathered)
+		if (p.endsWith("copper_grate") || p.contains("chiseled_copper") || p.endsWith("copper_door")
+				|| p.endsWith("copper_trapdoor")) {
+			return new Info(null, false, false, false, 3);
+		}
+
 		// natural structure markers (used to avoid false positives)
 		switch (p) {
+			case "trial_spawner", "vault" -> { return new Info(null, false, false, false, 3); }
 			case "sculk", "sculk_shrieker", "sculk_catalyst", "sculk_sensor", "calibrated_sculk_sensor",
 					"reinforced_deepslate" -> { return new Info(null, false, false, false, 1); }
-			case "trial_spawner", "vault", "spawner", "end_portal_frame", "bell" -> { return new Info(null, false, false, false, 2); }
+			case "spawner", "end_portal_frame", "bell" -> { return new Info(null, false, false, false, 2); }
 			default -> {}
 		}
 
 		// man-placed light
 		switch (p) {
-			case "torch", "wall_torch", "copper_torch", "copper_wall_torch", "lantern", "jack_o_lantern" -> {
+			case "torch", "wall_torch", "lantern", "jack_o_lantern" -> {
 				return new Info(Cat.LIGHT, false, true, false, 0);
 			}
 			case "soul_torch", "soul_wall_torch", "soul_lantern" -> {
@@ -454,12 +481,17 @@ public class BaseFinder extends Module {
 			}
 			default -> {}
 		}
-		if (p.endsWith("copper_lantern") || p.endsWith("froglight")) return new Info(Cat.LIGHT, false, true, false, 0);
+		// copper lights are all over trial chambers, so they count as "soft" (ignored in/next to one)
+		if (p.endsWith("copper_torch") || p.endsWith("copper_wall_torch") || p.endsWith("copper_lantern")) {
+			return new Info(Cat.LIGHT, false, true, true, 0);
+		}
+		if (p.endsWith("copper_bulb")) return new Info(Cat.LIGHT, true, true, true, 0);
+		if (p.endsWith("froglight")) return new Info(Cat.LIGHT, false, true, false, 0);
 		if (p.equals("glowstone") || p.equals("shroomlight")) {
 			return nether ? NONE : new Info(Cat.LIGHT, false, true, false, 0);
 		}
 		if (p.equals("end_rod")) return end ? NONE : new Info(Cat.LIGHT, false, true, false, 0);
-		if (p.equals("redstone_lamp") || p.equals("campfire") || p.equals("soul_campfire") || p.endsWith("copper_bulb")) {
+		if (p.equals("redstone_lamp") || p.equals("campfire") || p.equals("soul_campfire")) {
 			return new Info(Cat.LIGHT, true, true, false, 0);
 		}
 		if (p.equals("candle") || p.endsWith("_candle")) return new Info(Cat.LIGHT, true, true, true, 0);
@@ -584,7 +616,7 @@ public class BaseFinder extends Module {
 	@Override
 	public void onRenderHud(GuiGraphics g) {
 		Minecraft mc = Minecraft.getInstance();
-		if (!esp || mc.player == null || mc.level == null || mc.options.hideGui || results.isEmpty()) return;
+		if (!esp || mc.player == null || mc.level == null || mc.options.hideGui || (results.isEmpty() && testResults.isEmpty())) return;
 
 		double yaw = Math.toRadians(mc.player.getYRot());
 		double pitch = Math.toRadians(mc.player.getXRot());
@@ -599,7 +631,9 @@ public class BaseFinder extends Module {
 
 		// {distance, x, y, z, category}
 		List<double[]> targets = new ArrayList<>();
-		for (ChunkResult r : results.values()) {
+		List<ChunkResult> all = new ArrayList<>(results.values());
+		all.addAll(testResults);
+		for (ChunkResult r : all) {
 			for (Cat c : Cat.values()) {
 				if (!catFlagged(r, c)) continue;
 				for (int[] p : r.pos.get(c)) {
@@ -693,6 +727,7 @@ public class BaseFinder extends Module {
 		switch (sub) {
 			case "help" -> {
 				ChatUtil.info("\u00a7f.bf list \u00a77- flagged spots, nearest first");
+				ChatUtil.info("\u00a7f.bf test \u00a77- drop fake markers in front of you to check the ESP (30 s) | \u00a7f.bf test clear");
 				ChatUtil.info("\u00a7f.bf nearest \u00a77- direction + distance to the closest flagged spot");
 				ChatUtil.info("\u00a7f.bf log on|off \u00a77- save finds to config/hackerclient/");
 				ChatUtil.info("\u00a7f.bf status \u00a77/ \u00a7f.bf clear");
@@ -704,6 +739,7 @@ public class BaseFinder extends Module {
 			}
 			case "list" -> list(mc);
 			case "nearest" -> nearest(mc);
+			case "test" -> test(mc, args.length > 1 && args[1].equalsIgnoreCase("clear"));
 			case "log" -> {
 				if (args.length > 1) log = args[1].equalsIgnoreCase("on");
 				ChatUtil.info("log " + (log ? "\u00a7aon" : "\u00a7coff"));
@@ -782,6 +818,58 @@ public class BaseFinder extends Module {
 			}
 			ChatUtil.info(sb + "\u00a77at " + fmt(mc, anchor(r)));
 		}
+	}
+
+	/** Spawns fake markers around you (not real finds, not logged) so you can check the ESP, labels and BASE tag. */
+	private void test(Minecraft mc, boolean clear) {
+		if (mc.player == null) return;
+		testResults.clear();
+		if (clear) { ChatUtil.info("Test markers cleared."); return; }
+
+		double yaw = Math.toRadians(mc.player.getYRot());
+		double fx = -Math.sin(yaw), fz = Math.cos(yaw);   // forward
+		double rx = -Math.cos(yaw), rz = -Math.sin(yaw);  // right
+		int px = (int) Math.floor(mc.player.getX()), py = (int) Math.floor(mc.player.getY()), pz = (int) Math.floor(mc.player.getZ());
+
+		// 1) a "likely base" 25 blocks ahead: lights + storage + machines + living + frames
+		ChunkResult base = new ChunkResult();
+		base.pos.put(Cat.LIGHT, testPoints(px, py, pz, fx, fz, rx, rz, 25, 0, 3));
+		base.pos.put(Cat.STORAGE, testPoints(px, py, pz, fx, fz, rx, rz, 27, 3, 3));
+		base.pos.put(Cat.MACHINE, testPoints(px, py, pz, fx, fz, rx, rz, 29, -3, 6));
+		base.pos.put(Cat.LIVING, testPoints(px, py, pz, fx, fz, rx, rz, 26, -5, 2));
+		base.pos.put(Cat.ENTITY, testPoints(px, py, pz, fx, fz, rx, rz, 28, 5, 2));
+		testResults.add(base);
+
+		// 2) a lone portal far ahead and to the right (checks the "far = stronger highlight")
+		ChunkResult portal = new ChunkResult();
+		portal.pos.put(Cat.PORTAL, testPoints(px, py, pz, fx, fz, rx, rz, 90, 30, 1));
+		testResults.add(portal);
+
+		// 3) valuables behind you (checks the screen-edge arrow)
+		ChunkResult behind = new ChunkResult();
+		behind.pos.put(Cat.VALUABLE, testPoints(px, py, pz, fx, fz, rx, rz, -40, 0, 1));
+		testResults.add(behind);
+
+		// 4) a farm to the left, deep underground
+		ChunkResult farm = new ChunkResult();
+		farm.pos.put(Cat.FARM, testPoints(px, Math.max(py - 40, -60), pz, fx, fz, rx, rz, 15, -35, 4));
+		testResults.add(farm);
+
+		testUntil = tick + 600;
+		ChatUtil.info("\u00a7eTEST\u00a7r placed " + testResults.size() + " fake spots. Look ahead: the cluster should say BASE.");
+		ChatUtil.info("\u00a77Portal far ahead-right, valuables behind you (edge arrow), farm left and below. Gone in 30 s.");
+		ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(5 signs) at " + fmt(mc, base.pos.get(Cat.LIGHT).get(0)) + " \u00a78[test]");
+	}
+
+	private static List<int[]> testPoints(int px, int py, int pz, double fx, double fz, double rx, double rz,
+			double ahead, double right, int n) {
+		List<int[]> l = new ArrayList<>();
+		for (int i = 0; i < n; i++) {
+			int x = (int) Math.floor(px + fx * ahead + rx * (right + i));
+			int z = (int) Math.floor(pz + fz * ahead + rz * (right + i));
+			l.add(new int[] { x, py + (i % 2), z });
+		}
+		return l;
 	}
 
 	private void nearest(Minecraft mc) {
