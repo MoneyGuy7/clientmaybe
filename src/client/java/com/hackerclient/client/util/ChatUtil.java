@@ -12,7 +12,7 @@ public final class ChatUtil {
 	public static void info(String message) {
 		Minecraft mc = Minecraft.getInstance();
 		if (mc.player != null) {
-			mc.player.sendSystemMessage(Component.literal(PREFIX + message));
+			mc.gui.getChat().addMessage(Component.literal(PREFIX + message));
 		}
 	}
 }
