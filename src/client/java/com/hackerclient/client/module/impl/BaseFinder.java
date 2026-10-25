@@ -648,12 +648,22 @@ public class BaseFinder extends Module {
 		for (int i = 0; i < count; i++) {
 			drawTarget(g, mc, cam, targets.get(i), i < 30);
 		}
+
+		// One always-labelled BASE marker per likely-base chunk, drawn last (on top). These ignore the
+		// 30-label / 200-box caps, so they stay visible when you are high up and a lot is in range.
+		for (ChunkResult r : all) {
+			if (!likelyBase(r)) continue;
+			int[] a = anchor(r);
+			if (a == null) continue;
+			double dx = a[0] + 0.5 - cam.ex, dy = a[1] + 0.5 - cam.ey, dz = a[2] + 0.5 - cam.ez;
+			drawTarget(g, mc, cam, new double[] { Math.sqrt(dx * dx + dy * dy + dz * dz), a[0], a[1], a[2], -1, 1 }, true);
+		}
 	}
 
 	private static void drawTarget(GuiGraphics g, Minecraft mc, Cam c, double[] t, boolean label) {
 		double dist = t[0];
 		double bx = t[1], by = t[2], bz = t[3];
-		int rgb = Cat.values()[(int) t[4]].rgb;
+		int rgb = t[4] < 0 ? 0xFF3030 : Cat.values()[(int) t[4]].rgb;
 
 		// The further away the target, the stronger the highlight: thicker outline, bigger minimum size, more fill.
 		double far = Math.max(0, Math.min(1, (dist - 12) / 100.0));
@@ -676,7 +686,7 @@ public class BaseFinder extends Module {
 			allFront = true;
 		}
 
-		String text = (int) dist + "m  y" + (int) by + (t[5] == 1 ? "  BASE" : "");
+		String text = (t[5] == 1 ? "BASE  " : "") + (int) dist + "m  y" + (int) by;
 
 		if (allFront && maxX >= 0 && minX <= c.w && maxY >= 0 && minY <= c.h) {
 			int x1 = (int) Math.floor(minX), x2 = (int) Math.ceil(maxX);
