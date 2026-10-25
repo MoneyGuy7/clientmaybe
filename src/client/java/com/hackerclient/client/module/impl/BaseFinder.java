@@ -145,6 +145,8 @@ public class BaseFinder extends Module {
 	private final List<ChunkResult> testResults = new ArrayList<>();
 	private int testUntil;
 	private boolean log = true;
+	private boolean badge = true;
+	private int baseFlashUntil;
 
 	public BaseFinder() {
 		super("BaseFinder", "Finds player bases (light, amethyst, storage, machines, builds, farms, portals...) and highlights them", "bf");
@@ -371,6 +373,7 @@ public class BaseFinder extends Module {
 		if (Integer.bitCount(newMask) >= LIKELY_BASE_CATS && Integer.bitCount(oldMask) < LIKELY_BASE_CATS) {
 			int[] a = anchor(r);
 			String where = a == null ? "?" : fmt(mc, a);
+			baseFlashUntil = tick + 100;
 			ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(" + Integer.bitCount(newMask) + " signs) at " + where);
 			logLine("LIKELY BASE (" + Integer.bitCount(newMask) + " signs)", a);
 		}
@@ -616,7 +619,9 @@ public class BaseFinder extends Module {
 	@Override
 	public void onRenderHud(GuiGraphics g) {
 		Minecraft mc = Minecraft.getInstance();
-		if (!esp || mc.player == null || mc.level == null || mc.options.hideGui || (results.isEmpty() && testResults.isEmpty())) return;
+		if (mc.player == null || mc.level == null || mc.options.hideGui) return;
+		if (badge) drawBadge(g, mc);
+		if (!esp || (results.isEmpty() && testResults.isEmpty())) return;
 
 		double yaw = Math.toRadians(mc.player.getYRot());
 		double pitch = Math.toRadians(mc.player.getXRot());
@@ -658,6 +663,55 @@ public class BaseFinder extends Module {
 			double dx = a[0] + 0.5 - cam.ex, dy = a[1] + 0.5 - cam.ey, dz = a[2] + 0.5 - cam.ez;
 			drawTarget(g, mc, cam, new double[] { Math.sqrt(dx * dx + dy * dy + dz * dz), a[0], a[1], a[2], -1, 1 }, true);
 		}
+	}
+
+	/** Corner badge: red "BASE FOUND" (flashing for 5 s when a new one shows up), grey when nothing is found. */
+	private void drawBadge(GuiGraphics g, Minecraft mc) {
+		List<ChunkResult> all = new ArrayList<>(results.values());
+		all.addAll(testResults);
+		int count = 0;
+		int[] best = null;
+		double bestD = Double.MAX_VALUE;
+		for (ChunkResult r : all) {
+			if (!likelyBase(r)) continue;
+			int[] a = anchor(r);
+			if (a == null) continue;
+			count++;
+			double d = dist2(a, mc.player.getX(), mc.player.getZ());
+			if (d < bestD) { bestD = d; best = a; }
+		}
+
+		String text;
+		int bg, border, fg;
+		if (best != null) {
+			double dx = best[0] + 0.5 - mc.player.getX(), dz = best[2] + 0.5 - mc.player.getZ();
+			text = "BASE FOUND" + (count > 1 ? " x" + count : "") + "  " + (int) Math.sqrt(bestD) + "m " + dirName(dx, dz);
+			boolean flash = tick < baseFlashUntil && (tick / 5) % 2 == 0;
+			bg = flash ? 0xFFFF2020 : 0xE0A00000;
+			border = 0xFFFF6060;
+			fg = 0xFFFFFFFF;
+		} else {
+			text = "BaseFinder: no base";
+			bg = 0x70000000;
+			border = 0xFF555555;
+			fg = 0xFFAAAAAA;
+		}
+
+		int w = mc.font.width(text) + 10, h = 14;
+		int x = mc.getWindow().getGuiScaledWidth() - w - 4, y = 4;
+		g.fill(x, y, x + w, y + h, bg);
+		g.fill(x, y, x + w, y + 1, border);
+		g.fill(x, y + h - 1, x + w, y + h, border);
+		g.fill(x, y, x + 1, y + h, border);
+		g.fill(x + w - 1, y, x + w, y + h, border);
+		g.drawString(mc.font, text, x + 5, y + 3, fg);
+	}
+
+	/** Compass direction for an offset (+x is east, +z is south). */
+	private static String dirName(double dx, double dz) {
+		String[] names = { "E", "SE", "S", "SW", "W", "NW", "N", "NE" };
+		double ang = Math.toDegrees(Math.atan2(dz, dx));
+		return names[(int) Math.round(((ang % 360) + 360) % 360 / 45.0) % 8];
 	}
 
 	private static void drawTarget(GuiGraphics g, Minecraft mc, Cam c, double[] t, boolean label) {
@@ -738,6 +792,7 @@ public class BaseFinder extends Module {
 			case "help" -> {
 				ChatUtil.info("\u00a7f.bf list \u00a77- flagged spots, nearest first");
 				ChatUtil.info("\u00a7f.bf test \u00a77- drop fake markers in front of you to check the ESP (30 s) | \u00a7f.bf test clear");
+				ChatUtil.info("\u00a7f.bf badge on|off \u00a77- corner \"BASE FOUND\" indicator");
 				ChatUtil.info("\u00a7f.bf nearest \u00a77- direction + distance to the closest flagged spot");
 				ChatUtil.info("\u00a7f.bf log on|off \u00a77- save finds to config/hackerclient/");
 				ChatUtil.info("\u00a7f.bf status \u00a77/ \u00a7f.bf clear");
@@ -749,6 +804,10 @@ public class BaseFinder extends Module {
 			}
 			case "list" -> list(mc);
 			case "nearest" -> nearest(mc);
+			case "badge" -> {
+				if (args.length > 1) badge = args[1].equalsIgnoreCase("on");
+				ChatUtil.info("badge " + (badge ? "\u00a7aon" : "\u00a7coff"));
+			}
 			case "test" -> test(mc, args.length > 1 && args[1].equalsIgnoreCase("clear"));
 			case "log" -> {
 				if (args.length > 1) log = args[1].equalsIgnoreCase("on");
@@ -866,6 +925,7 @@ public class BaseFinder extends Module {
 		testResults.add(farm);
 
 		testUntil = tick + 600;
+		baseFlashUntil = tick + 100;
 		ChatUtil.info("\u00a7eTEST\u00a7r placed " + testResults.size() + " fake spots. Look ahead: the cluster should say BASE.");
 		ChatUtil.info("\u00a77Portal far ahead-right, valuables behind you (edge arrow), farm left and below. Gone in 30 s.");
 		ChatUtil.info("\u00a74\u00a7lLIKELY BASE \u00a7r\u00a77(5 signs) at " + fmt(mc, base.pos.get(Cat.LIGHT).get(0)) + " \u00a78[test]");
