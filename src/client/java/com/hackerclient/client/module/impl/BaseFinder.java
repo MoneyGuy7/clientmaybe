@@ -4,7 +4,6 @@ import com.hackerclient.client.module.Module;
 import com.hackerclient.client.util.ChatUtil;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
@@ -105,6 +104,10 @@ public class BaseFinder extends Module {
 
 	// ------------------------------------------------------------------ scanning
 
+	private static long chunkKey(int cx, int cz) {
+		return ((long) cx << 32) | (cz & 0xFFFFFFFFL);
+	}
+
 	private void reset() {
 		results.clear();
 		lastScan.clear();
@@ -123,7 +126,7 @@ public class BaseFinder extends Module {
 				int dist2 = dx * dx + dz * dz;
 				if (dist2 > radiusChunks * radiusChunks) continue;
 				int cx = pcx + dx, cz = pcz + dz;
-				Integer last = lastScan.get(ChunkPos.asLong(cx, cz));
+				Integer last = lastScan.get(chunkKey(cx, cz));
 				if (last != null && tick - last < RESCAN_TICKS) continue;
 				todo.add(new int[] { dist2, cx, cz });
 			}
@@ -136,7 +139,7 @@ public class BaseFinder extends Module {
 		LevelChunk chunk = mc.level.getChunkSource().getChunkNow(cx, cz);
 		if (chunk == null) return;
 
-		long key = ChunkPos.asLong(cx, cz);
+		long key = chunkKey(cx, cz);
 		lastScan.put(key, tick);
 
 		boolean nether = mc.level.dimension() == Level.NETHER;
@@ -268,111 +271,3 @@ public class BaseFinder extends Module {
 		}
 		if (p.endsWith("copper_lantern") || p.endsWith("froglight")) return Kind.LIGHT;
 		// natural in some dimensions, so only count where players had to place them
-		if (p.equals("glowstone") || p.equals("shroomlight")) return nether ? Kind.NONE : Kind.LIGHT;
-		if (p.equals("end_rod")) return end ? Kind.NONE : Kind.LIGHT;
-
-		// light that only counts while lit
-		if (p.equals("redstone_lamp") || p.equals("campfire") || p.equals("soul_campfire")
-				|| p.endsWith("copper_bulb") || p.equals("candle") || p.endsWith("_candle")) {
-			return Kind.LIT_LIGHT;
-		}
-
-		// blocks that never generate inside a natural geode
-		switch (p) {
-			case "hopper", "dropper", "dispenser", "observer", "piston", "sticky_piston",
-					"chest", "trapped_chest", "barrel", "ladder", "scaffolding",
-					"redstone_wire", "repeater", "comparator", "lever", "redstone_block",
-					"slime_block", "honey_block", "target", "redstone_torch", "redstone_wall_torch" -> {
-				return Kind.PLAYER;
-			}
-			default -> {}
-		}
-		return Kind.NONE;
-	}
-
-	// ------------------------------------------------------------------ output
-
-	private void announce(Minecraft mc, ChunkResult r) {
-		if (findLights && r.lights >= minLights && r.firstLight != null) {
-			ChatUtil.info("\u00a7eMan-placed light \u00a7fx" + r.lights + " \u00a77at " + fmt(mc, r.firstLight));
-		}
-		if (findAmethyst && r.amethyst > 0 && r.firstAmethyst != null) {
-			ChatUtil.info("\u00a7dGrown amethyst \u00a7fx" + r.amethyst + " \u00a77at " + fmt(mc, r.firstAmethyst));
-		}
-	}
-
-	private static String fmt(Minecraft mc, int[] p) {
-		double dx = p[0] + 0.5 - mc.player.getX();
-		double dz = p[2] + 0.5 - mc.player.getZ();
-		int dist = (int) Math.sqrt(dx * dx + dz * dz);
-		return p[0] + ", " + p[1] + ", " + p[2] + " \u00a78(" + dist + "m)";
-	}
-
-	// ------------------------------------------------------------------ commands
-
-	@Override
-	public boolean onCommand(String[] args) {
-		Minecraft mc = Minecraft.getInstance();
-		String sub = args.length == 0 ? "help" : args[0].toLowerCase();
-
-		switch (sub) {
-			case "help" -> {
-				ChatUtil.info("\u00a7f.bf list \u00a77- show flagged spots, nearest first");
-				ChatUtil.info("\u00a7f.bf clear \u00a77- forget results and rescan");
-				ChatUtil.info("\u00a7f.bf status \u00a77- show settings");
-				ChatUtil.info("\u00a7f.bf set radius <2-32> \u00a77- scan radius in chunks");
-				ChatUtil.info("\u00a7f.bf set lights <count> \u00a77- lights needed to flag a chunk");
-				ChatUtil.info("\u00a7f.bf lights on|off \u00a77/ \u00a7f.bf amethyst on|off");
-			}
-			case "list" -> list(mc);
-			case "clear" -> { reset(); lastLevel = mc.level; ChatUtil.info("Cleared."); }
-			case "status" -> ChatUtil.info("radius=" + radiusChunks + " chunks, minLights=" + minLights
-					+ ", lights=" + findLights + ", amethyst=" + findAmethyst
-					+ ", chunksTracked=" + results.size());
-			case "lights" -> { if (args.length > 1) { findLights = args[1].equalsIgnoreCase("on"); ChatUtil.info("lights " + findLights); } }
-			case "amethyst" -> { if (args.length > 1) { findAmethyst = args[1].equalsIgnoreCase("on"); ChatUtil.info("amethyst " + findAmethyst); } }
-			case "set" -> {
-				if (args.length < 3) { ChatUtil.info("Usage: .bf set radius|lights <number>"); return true; }
-				int n;
-				try { n = Integer.parseInt(args[2]); } catch (NumberFormatException e) { ChatUtil.info("\u00a7cNot a number"); return true; }
-				switch (args[1].toLowerCase()) {
-					case "radius" -> { radiusChunks = Math.max(2, Math.min(32, n)); ChatUtil.info("radius = " + radiusChunks); }
-					case "lights" -> { minLights = Math.max(1, n); alerted.clear(); ChatUtil.info("minLights = " + minLights); }
-					default -> ChatUtil.info("\u00a7cUnknown setting");
-				}
-			}
-			default -> { return false; }
-		}
-		return true;
-	}
-
-	private void list(Minecraft mc) {
-		if (mc.player == null) return;
-		List<Map.Entry<Long, ChunkResult>> flagged = new ArrayList<>();
-		for (Map.Entry<Long, ChunkResult> e : results.entrySet()) {
-			if (isFlagged(e.getValue())) flagged.add(e);
-		}
-		if (flagged.isEmpty()) { ChatUtil.info("Nothing flagged yet."); return; }
-
-		double px = mc.player.getX(), pz = mc.player.getZ();
-		flagged.sort((a, b) -> Double.compare(dist2(a.getValue(), px, pz), dist2(b.getValue(), px, pz)));
-
-		ChatUtil.info("Flagged spots (" + flagged.size() + "), nearest first:");
-		int shown = 0;
-		for (Map.Entry<Long, ChunkResult> e : flagged) {
-			if (shown++ >= 10) break;
-			ChunkResult r = e.getValue();
-			StringBuilder sb = new StringBuilder();
-			if (findLights && r.lights >= minLights) sb.append("\u00a7elight x").append(r.lights).append(" ");
-			if (findAmethyst && r.amethyst > 0) sb.append("\u00a7damethyst x").append(r.amethyst).append(" ");
-			int[] where = (r.firstAmethyst != null && findAmethyst && r.amethyst > 0) ? r.firstAmethyst : r.firstLight;
-			ChatUtil.info(sb + "\u00a77at " + fmt(mc, where));
-		}
-	}
-
-	private double dist2(ChunkResult r, double px, double pz) {
-		int[] p = r.firstLight != null ? r.firstLight : r.firstAmethyst;
-		double dx = p[0] - px, dz = p[2] - pz;
-		return dx * dx + dz * dz;
-	}
-}
