@@ -6,11 +6,22 @@ import net.minecraft.client.gui.GuiGraphics;
 public abstract class Module {
 	private final String name;
 	private final String description;
+	private final String[] aliases;
 	private boolean enabled;
 
-	protected Module(String name, String description) {
+	protected Module(String name, String description, String... aliases) {
 		this.name = name;
 		this.description = description;
+		this.aliases = aliases;
+	}
+
+	/** True if the typed name is this module's name or one of its aliases (case-insensitive). */
+	public boolean matches(String typed) {
+		if (name.equalsIgnoreCase(typed)) return true;
+		for (String a : aliases) {
+			if (a.equalsIgnoreCase(typed)) return true;
+		}
+		return false;
 	}
 
 	public String getName() { return name; }

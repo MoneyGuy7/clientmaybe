@@ -18,7 +18,7 @@ public final class ModuleManager {
 
 	public static Module get(String name) {
 		for (Module m : MODULES) {
-			if (m.getName().equalsIgnoreCase(name)) return m;
+			if (m.matches(name)) return m;
 		}
 		return null;
 	}
