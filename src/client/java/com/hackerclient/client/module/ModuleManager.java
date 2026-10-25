@@ -1,6 +1,7 @@
 package com.hackerclient.client.module;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,6 +27,12 @@ public final class ModuleManager {
 		for (Module m : MODULES) {
 			m.onAlwaysTick(mc);
 			if (m.isEnabled()) m.onTick(mc);
+		}
+	}
+
+	public static void renderHud(GuiGraphics graphics) {
+		for (Module m : MODULES) {
+			if (m.isEnabled()) m.onRenderHud(graphics);
 		}
 	}
 }

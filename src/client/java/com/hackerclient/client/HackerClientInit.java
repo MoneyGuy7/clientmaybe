@@ -5,6 +5,7 @@ import com.hackerclient.client.module.ModuleManager;
 import com.hackerclient.client.module.impl.BaseFinder;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 
 public class HackerClientInit implements ClientModInitializer {
 	@Override
@@ -13,5 +14,6 @@ public class HackerClientInit implements ClientModInitializer {
 
 		DotCommands.init();
 		ClientTickEvents.END_CLIENT_TICK.register(ModuleManager::tick);
+		HudRenderCallback.EVENT.register((graphics, tickCounter) -> ModuleManager.renderHud(graphics));
 	}
 }

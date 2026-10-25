@@ -3,6 +3,7 @@ package com.hackerclient.client.module.impl;
 import com.hackerclient.client.module.Module;
 import com.hackerclient.client.util.ChatUtil;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
@@ -39,6 +40,8 @@ public class BaseFinder extends Module {
 		int amethyst;
 		int[] firstLight;    // {x, y, z}
 		int[] firstAmethyst; // {x, y, z}
+		List<int[]> lightPos = new ArrayList<>();
+		List<int[]> amethystPos = new ArrayList<>();
 	}
 
 	// ---- settings (change with .bf set ...) ----
@@ -46,6 +49,7 @@ public class BaseFinder extends Module {
 	private int minLights = 3;
 	private boolean findLights = true;
 	private boolean findAmethyst = true;
+	private boolean esp = true;
 
 	// ---- tuning ----
 	private static final int CHUNKS_PER_TICK = 2;
@@ -183,6 +187,7 @@ public class BaseFinder extends Module {
 
 		if (findLights) {
 			r.lights = lights.size();
+			r.lightPos = lights;
 			if (!lights.isEmpty()) r.firstLight = lights.get(0);
 		}
 
@@ -208,6 +213,7 @@ public class BaseFinder extends Module {
 			for (int[] a : amethyst) {
 				if (nearAny(a, player)) {
 					r.amethyst++;
+					r.amethystPos.add(a);
 					if (r.firstAmethyst == null) r.firstAmethyst = a;
 				}
 			}
@@ -271,7 +277,6 @@ public class BaseFinder extends Module {
 		}
 		if (p.endsWith("copper_lantern") || p.endsWith("froglight")) return Kind.LIGHT;
 		// natural in some dimensions, so only count where players had to place them
-		// natural in some dimensions, so only count where players had to place them
 		if (p.equals("glowstone") || p.equals("shroomlight")) return nether ? Kind.NONE : Kind.LIGHT;
 		if (p.equals("end_rod")) return end ? Kind.NONE : Kind.LIGHT;
 
@@ -312,6 +317,135 @@ public class BaseFinder extends Module {
 		return p[0] + ", " + p[1] + ", " + p[2] + " \u00a78(" + dist + "m)";
 	}
 
+	// ------------------------------------------------------------------ ESP (on-screen highlights)
+
+	private record Cam(double ex, double ey, double ez,
+			double fx, double fy, double fz,
+			double rx, double ry, double rz,
+			double ux, double uy, double uz,
+			double tanHalf, double aspect, int w, int h) {}
+
+	private static int argb(int alpha, int rgb) {
+		return ((alpha & 0xFF) << 24) | (rgb & 0xFFFFFF);
+	}
+
+	/** Returns {screenX, screenY, depth, visible(1/0)}. When behind the camera, x/y hold camera-space x/y instead. */
+	private static double[] project(Cam c, double x, double y, double z) {
+		double dx = x - c.ex, dy = y - c.ey, dz = z - c.ez;
+		double depth = dx * c.fx + dy * c.fy + dz * c.fz;
+		double cx = dx * c.rx + dy * c.ry + dz * c.rz;
+		double cy = dx * c.ux + dy * c.uy + dz * c.uz;
+		if (depth < 0.05) return new double[] { cx, cy, depth, 0 };
+		double nx = cx / (depth * c.tanHalf * c.aspect);
+		double ny = cy / (depth * c.tanHalf);
+		return new double[] { c.w / 2.0 + nx * c.w / 2.0, c.h / 2.0 - ny * c.h / 2.0, depth, 1 };
+	}
+
+	@Override
+	public void onRenderHud(GuiGraphics g) {
+		Minecraft mc = Minecraft.getInstance();
+		if (!esp || mc.player == null || mc.level == null || mc.options.hideGui || results.isEmpty()) return;
+
+		double yaw = Math.toRadians(mc.player.getYRot());
+		double pitch = Math.toRadians(mc.player.getXRot());
+		double fx = -Math.sin(yaw) * Math.cos(pitch), fy = -Math.sin(pitch), fz = Math.cos(yaw) * Math.cos(pitch);
+		double rx = -Math.cos(yaw), ry = 0, rz = -Math.sin(yaw);
+		double ux = ry * fz - rz * fy, uy = rz * fx - rx * fz, uz = rx * fy - ry * fx;
+		int w = mc.getWindow().getGuiScaledWidth();
+		int h = mc.getWindow().getGuiScaledHeight();
+		double tanHalf = Math.tan(Math.toRadians(mc.options.fov().get()) / 2.0);
+		Cam cam = new Cam(mc.player.getX(), mc.player.getEyeY(), mc.player.getZ(),
+				fx, fy, fz, rx, ry, rz, ux, uy, uz, tanHalf, (double) w / h, w, h);
+
+		// {distance, x, y, z, type}
+		List<double[]> targets = new ArrayList<>();
+		for (ChunkResult r : results.values()) {
+			if (!isFlagged(r)) continue;
+			if (findLights && r.lights >= minLights) addTargets(targets, r.lightPos, 0, cam);
+			if (findAmethyst && r.amethyst > 0) addTargets(targets, r.amethystPos, 1, cam);
+		}
+		targets.sort((a, b) -> Double.compare(a[0], b[0]));
+
+		int count = Math.min(targets.size(), 150);
+		for (int i = 0; i < count; i++) {
+			drawTarget(g, mc, cam, targets.get(i), i < 25);
+		}
+	}
+
+	private static void addTargets(List<double[]> out, List<int[]> positions, int type, Cam c) {
+		for (int[] p : positions) {
+			double dx = p[0] + 0.5 - c.ex, dy = p[1] + 0.5 - c.ey, dz = p[2] + 0.5 - c.ez;
+			out.add(new double[] { Math.sqrt(dx * dx + dy * dy + dz * dz), p[0], p[1], p[2], type });
+		}
+	}
+
+	private static void drawTarget(GuiGraphics g, Minecraft mc, Cam c, double[] t, boolean label) {
+		double dist = t[0];
+		double bx = t[1], by = t[2], bz = t[3];
+		int rgb = ((int) t[4]) == 0 ? 0xFFE04A : 0xD05CFF;
+
+		// The further away the target, the stronger the highlight: thicker outline, bigger minimum size, more fill.
+		double far = Math.max(0, Math.min(1, (dist - 12) / 100.0));
+		int thickness = 1 + (int) Math.round(far * 2);
+		int minSize = 6 + (int) (far * 10);
+
+		double[] center = project(c, bx + 0.5, by + 0.5, bz + 0.5);
+
+		double minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+		boolean allFront = true;
+		for (int i = 0; i < 8; i++) {
+			double[] p = project(c, bx + (i & 1), by + ((i >> 1) & 1), bz + ((i >> 2) & 1));
+			if (p[3] == 0) { allFront = false; break; }
+			minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
+			minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
+		}
+		if (!allFront && center[3] == 1) {
+			minX = maxX = center[0];
+			minY = maxY = center[1];
+			allFront = true;
+		}
+
+		String text = (int) dist + "m";
+
+		if (allFront && maxX >= 0 && minX <= c.w && maxY >= 0 && minY <= c.h) {
+			int x1 = (int) Math.floor(minX), x2 = (int) Math.ceil(maxX);
+			int y1 = (int) Math.floor(minY), y2 = (int) Math.ceil(maxY);
+			int cxp = (x1 + x2) / 2, cyp = (y1 + y2) / 2;
+			if (x2 - x1 < minSize) { x1 = cxp - minSize / 2; x2 = x1 + minSize; }
+			if (y2 - y1 < minSize) { y1 = cyp - minSize / 2; y2 = y1 + minSize; }
+
+			g.fill(x1, y1, x2, y2, argb(0x28 + (int) (far * 0x60), rgb));
+			g.fill(x1, y1, x2, y1 + thickness, argb(0xFF, rgb));
+			g.fill(x1, y2 - thickness, x2, y2, argb(0xFF, rgb));
+			g.fill(x1, y1, x1 + thickness, y2, argb(0xFF, rgb));
+			g.fill(x2 - thickness, y1, x2, y2, argb(0xFF, rgb));
+			if (label) drawLabel(g, mc, text, (x1 + x2) / 2, Math.max(1, y1 - 10), argb(0xFF, rgb));
+			return;
+		}
+
+		// Off-screen (or behind you): pin an arrow-marker to the screen edge in that direction.
+		double dx, dy;
+		if (center[3] == 1) { dx = center[0] - c.w / 2.0; dy = center[1] - c.h / 2.0; }
+		else { dx = center[0]; dy = -center[1]; }
+		double len = Math.sqrt(dx * dx + dy * dy);
+		if (len < 1e-4) { dx = 0; dy = 1; len = 1; }
+		dx /= len; dy /= len;
+
+		int margin = 14;
+		double hx = c.w / 2.0 - margin, hy = c.h / 2.0 - margin;
+		double sx = Math.abs(dx) < 1e-6 ? 1e9 : hx / Math.abs(dx);
+		double sy = Math.abs(dy) < 1e-6 ? 1e9 : hy / Math.abs(dy);
+		double s = Math.min(sx, sy);
+		int px = (int) (c.w / 2.0 + dx * s), py = (int) (c.h / 2.0 + dy * s);
+		int size = 6 + (int) (far * 6);
+		g.fill(px - size / 2, py - size / 2, px + size / 2, py + size / 2, argb(0xFF, rgb));
+		if (label) drawLabel(g, mc, text, px, Math.max(1, py - size / 2 - 10), argb(0xFF, rgb));
+	}
+
+	private static void drawLabel(GuiGraphics g, Minecraft mc, String text, int centerX, int y, int color) {
+		g.drawString(mc.font, text, centerX - mc.font.width(text) / 2, y, color);
+	}
+
 	// ------------------------------------------------------------------ commands
 
 	@Override
@@ -327,6 +461,7 @@ public class BaseFinder extends Module {
 				ChatUtil.info("\u00a7f.bf set radius <2-32> \u00a77- scan radius in chunks");
 				ChatUtil.info("\u00a7f.bf set lights <count> \u00a77- lights needed to flag a chunk");
 				ChatUtil.info("\u00a7f.bf lights on|off \u00a77/ \u00a7f.bf amethyst on|off");
+				ChatUtil.info("\u00a7f.bf esp on|off \u00a77- on-screen highlights");
 			}
 			case "list" -> list(mc);
 			case "clear" -> { reset(); lastLevel = mc.level; ChatUtil.info("Cleared."); }
@@ -334,6 +469,7 @@ public class BaseFinder extends Module {
 					+ ", lights=" + findLights + ", amethyst=" + findAmethyst
 					+ ", chunksTracked=" + results.size());
 			case "lights" -> { if (args.length > 1) { findLights = args[1].equalsIgnoreCase("on"); ChatUtil.info("lights " + findLights); } }
+			case "esp" -> { if (args.length > 1) { esp = args[1].equalsIgnoreCase("on"); ChatUtil.info("esp " + esp); } }
 			case "amethyst" -> { if (args.length > 1) { findAmethyst = args[1].equalsIgnoreCase("on"); ChatUtil.info("amethyst " + findAmethyst); } }
 			case "set" -> {
 				if (args.length < 3) { ChatUtil.info("Usage: .bf set radius|lights <number>"); return true; }
